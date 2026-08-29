@@ -23,39 +23,38 @@ import io.music_assistant.client.player.sendspin.model.AudioCodec
  * Built-in player (ExoPlayer) has been removed - Sendspin is now the only playback method.
  */
 actual class MediaPlayerController actual constructor(platformContext: PlatformContext) {
-    // Callback for remote commands - currently unused on Android (handled via different mechanism if needed)
     actual var onRemoteCommand: ((String) -> Unit)? = null
+
     private val logger = Logger.withTag("MediaPlayerController")
     private val context: Context = platformContext.applicationContext
     private val audioManager: AudioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    // AudioTrack for raw PCM streaming (Sendspin)
-    // @Volatile: read by audio dispatcher thread, written by main/focus-callback thread
     @Volatile private var audioTrack: AudioTrack? = null
-    private var audioTrackCreationTime: Long = 0 // Timestamp when AudioTrack was created
-    private var currentListener: MediaPlayerListener? = null // Track listener to signal errors
+    private var audioTrackCreationTime: Long = 0
+    private var currentListener: MediaPlayerListener? = null
 
-    // AudioFocus management for Android Auto
     private var audioFocusRequest: AudioFocusRequest? = null
-
     @Volatile private var hasAudioFocus = false
-
-    // Playback state - controls whether we should write audio data
-    // @Volatile: read by audio dispatcher thread, written by focus-callback thread
     @Volatile private var shouldPlayAudio = false
-
-    // True only while we hold a pause issued in response to audio-focus / telephony loss.
-    // GAIN auto-resumes only when this is set, so we never spontaneously start playback
-    // that the user didn't have running before the interruption.
     @Volatile private var pausedByFocusLoss = false
 
-    // Volume state (0-100)
     private var currentVolume: Int = 100
     private var isMuted: Boolean = false
 
-    // BroadcastReceiver for detecting audio becoming noisy (headphone disconnection)
-    // Backup mechanism in addition to audio focus handling
+    /**
+     * Issue #941 proof-of-concept.
+     *
+     * The Sendspin stream is treated as a short-lived announcement endpoint and requests
+     * AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK. Android can therefore keep another media app
+     * (Spotify, YouTube Music, radio, ...) playing at a reduced volume instead of forcing
+     * it to pause. Focus is explicitly abandoned when the Sendspin stream ends.
+     *
+     * This is intentionally hard-coded on this PoC branch. If device testing succeeds,
+     * this should become an opt-in local-player setting before an upstream PR.
+     */
+    private val useTransientDuckingFocus = true
+
     private val noisyAudioReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
@@ -66,13 +65,6 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
     }
     private var isNoisyReceiverRegistered = false
 
-    // Telephony backup for focus events: some Bluetooth / Android Auto routings don't
-    // deliver AUDIOFOCUS_LOSS_TRANSIENT cleanly on incoming calls. OnModeChangedListener
-    // (API 31+) fires on MODE_IN_CALL / MODE_IN_COMMUNICATION transitions and needs no
-    // runtime permission, so we use it as a redundant signal.
-    // Lazy so the API 31 OnModeChangedListener type is only referenced on API >= 31.
-    // An eager initializer runs in the constructor on every API level and throws
-    // NoClassDefFoundError on Android < 12, even though registration is SDK-guarded.
     @get:RequiresApi(Build.VERSION_CODES.S)
     private val modeChangedListener by lazy {
         AudioManager.OnModeChangedListener { mode ->
@@ -85,13 +77,10 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
                 audioTrack?.pause()
                 onRemoteCommand?.invoke("pause")
             }
-            // Resume is driven by AUDIOFOCUS_GAIN only — mode can return to NORMAL before
-            // focus is restored, and we only auto-resume what we paused.
         }
     }
     private var isModeChangedListenerRegistered = false
 
-    // AudioFocus listener for handling focus changes (Android Auto, phone calls, etc.)
     private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         when (focusChange) {
             AudioManager.AUDIOFOCUS_GAIN -> {
@@ -99,20 +88,15 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
                 hasAudioFocus = true
                 shouldPlayAudio = true
 
-                // Resume playback if it was paused
                 audioTrack?.let { track ->
                     if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
                         logger.i { "Resuming AudioTrack playback after focus gain" }
-                        // Flush any stale data that was written while paused
                         track.flush()
                         track.play()
                     }
                 }
-                // Restore volume if it was ducked
                 applyVolume()
 
-                // Only resume server playback if WE paused it on focus loss.
-                // Otherwise stay paused — don't start playing music the user hadn't started.
                 if (pausedByFocusLoss) {
                     pausedByFocusLoss = false
                     logger.i { "Resuming server playback after focus regain" }
@@ -123,8 +107,6 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
             AudioManager.AUDIOFOCUS_LOSS -> {
                 logger.w { "AudioFocus lost permanently (Android Auto connected, another app took focus, etc.)" }
                 hasAudioFocus = false
-                // Stop playback completely when we permanently lose audio focus
-                // This happens when Android Auto connects or another app takes over audio
                 handleAudioOutputDisconnected()
             }
 
@@ -143,44 +125,60 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
 
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 logger.i { "AudioFocus lost temporarily (can duck)" }
-                // Lower volume (duck) but continue playing
                 audioTrack?.setVolume(0.2f)
             }
         }
     }
 
-    // Request audio focus for playback (critical for Android Auto)
     private fun requestAudioFocus(): Boolean {
-        // Always request focus to ensure we're in sync with the system
-        // Even if we think we have it, re-requesting ensures proper state
-        logger.d { "Requesting audio focus (hasAudioFocus=$hasAudioFocus)" }
+        val focusGain = if (useTransientDuckingFocus) {
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+        } else {
+            AudioManager.AUDIOFOCUS_GAIN
+        }
+
+        logger.i {
+            "Requesting audio focus mode=${if (useTransientDuckingFocus) "TRANSIENT_MAY_DUCK" else "GAIN"} " +
+                "(hasAudioFocus=$hasAudioFocus)"
+        }
 
         val audioAttributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
             .build()
 
-        // Reuse existing request if we have one, or create new one
-        val request = audioFocusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+        // A request's focus-gain type is immutable. Build a fresh request so switching the
+        // future user setting cannot accidentally reuse a request created for another mode.
+        audioFocusRequest?.let {
+            try {
+                audioManager.abandonAudioFocusRequest(it)
+            } catch (e: Exception) {
+                logger.w(e) { "Failed to abandon previous audio focus request before re-request" }
+            }
+        }
+
+        val request = AudioFocusRequest.Builder(focusGain)
             .setAudioAttributes(audioAttributes)
             .setOnAudioFocusChangeListener(audioFocusChangeListener)
             .build()
         audioFocusRequest = request
-        val result = audioManager.requestAudioFocus(request)
 
+        val result = audioManager.requestAudioFocus(request)
         hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        logger.i { "Audio focus request result: ${if (hasAudioFocus) "GRANTED" else "DENIED"}" }
+        logger.i {
+            "Audio focus request (${if (useTransientDuckingFocus) "TRANSIENT_MAY_DUCK" else "GAIN"}) result: " +
+                if (hasAudioFocus) "GRANTED" else "DENIED"
+        }
         return hasAudioFocus
     }
 
-    // Release audio focus
     private fun releaseAudioFocus() {
-        if (!hasAudioFocus) {
-            return
-        }
+        val request = audioFocusRequest ?: return
 
-        audioFocusRequest?.let {
-            audioManager.abandonAudioFocusRequest(it)
+        try {
+            audioManager.abandonAudioFocusRequest(request)
+        } catch (e: Exception) {
+            logger.w(e) { "Failed to abandon audio focus request" }
         }
 
         hasAudioFocus = false
@@ -188,24 +186,15 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
         logger.i { "Audio focus released" }
     }
 
-    // Sendspin raw PCM streaming methods
-
-    /**
-     * Handle audio output disconnection (Android Auto, headphones, Bluetooth).
-     * Stop playback locally and signal error to stop the sendspin stream.
-     */
     private fun handleAudioOutputDisconnected() {
         logger.w { "Handling audio output disconnection - stopping sendspin stream" }
-
-        // Stop playback
         shouldPlayAudio = false
 
-        // Pause the AudioTrack
         audioTrack?.let { track ->
             try {
                 if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                     track.pause()
-                    track.flush() // Clear buffer
+                    track.flush()
                     logger.i { "AudioTrack paused and flushed due to output disconnection" }
                 }
             } catch (e: Exception) {
@@ -213,13 +202,10 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
             }
         }
 
-        // Release audio focus - we don't need it anymore since output is disconnected
         releaseAudioFocus()
-
-        // Signal error to stop the sendspin stream
-        // This will propagate up to AudioStreamManager which will call stopStream()
-        currentListener?.onError(Exception("Audio output disconnected (Android Auto, headphones, or Bluetooth)"))
-
+        currentListener?.onError(
+            Exception("Audio output disconnected (Android Auto, headphones, or Bluetooth)"),
+        )
         logger.i { "Sent error signal to stop sendspin stream. User should press play to resume on phone speakers." }
     }
 
@@ -231,27 +217,17 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
         codecHeader: String?,
         listener: MediaPlayerListener,
     ) {
-        // Android ignores codecHeader - it's only for iOS/MPV pass-through
         logger.i { "Preparing raw PCM stream: ${sampleRate}Hz, ${channels}ch, ${bitDepth}bit" }
-
-        // Store listener so we can signal errors (e.g., audio output disconnection)
         currentListener = listener
 
-        // Request audio focus before creating AudioTrack
         if (!requestAudioFocus()) {
             logger.w { "Failed to gain audio focus, but continuing anyway" }
         }
 
-        // Register noisy audio receiver (headphone unplug detection)
         registerNoisyAudioReceiver()
-
-        // Register telephony-mode listener (focus backup for incoming calls on AA/BT)
         registerModeChangedListener()
-
-        // Release existing AudioTrack if any
         audioTrack?.release()
 
-        // Convert parameters to Android AudioFormat constants
         val channelConfig = when (channels) {
             1 -> AudioFormat.CHANNEL_OUT_MONO
             2 -> AudioFormat.CHANNEL_OUT_STEREO
@@ -264,15 +240,16 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
         val encoding = when {
             bitDepth == 8 -> AudioFormat.ENCODING_PCM_8BIT
             bitDepth == 16 -> AudioFormat.ENCODING_PCM_16BIT
-            bitDepth == 24 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> AudioFormat.ENCODING_PCM_24BIT_PACKED
-            bitDepth == 32 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> AudioFormat.ENCODING_PCM_32BIT
+            bitDepth == 24 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
+                AudioFormat.ENCODING_PCM_24BIT_PACKED
+            bitDepth == 32 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
+                AudioFormat.ENCODING_PCM_32BIT
             else -> {
                 logger.w { "Unsupported bit depth: $bitDepth, using 16-bit" }
                 AudioFormat.ENCODING_PCM_16BIT
             }
         }
 
-        // Calculate buffer size
         val minBufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding)
         if (minBufferSize <= 0) {
             val errorName = when (minBufferSize) {
@@ -281,12 +258,11 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
                 else -> "UNKNOWN($minBufferSize)"
             }
             logger.e { "getMinBufferSize returned $errorName for ${sampleRate}Hz/${channels}ch/${bitDepth}bit" }
-            listener.onError(IllegalStateException("Audio configuration not supported by device: $errorName"))
+            listener.onError(
+                IllegalStateException("Audio configuration not supported by device: $errorName"),
+            )
             return
         }
-        // 4× minimum absorbs decode/scheduling jitter while keeping steady-state fill low.
-        // Larger multipliers (the previous 16×) add hundreds of ms of audible latency — unacceptable
-        // for group-sync use. Bump back up if we start seeing underruns on weaker devices.
         val bufferSize = minBufferSize * 4
 
         logger.i { "AudioTrack config: sampleRate=$sampleRate, channels=$channels, bitDepth=$bitDepth" }
@@ -309,12 +285,9 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
                 )
                 .setBufferSizeInBytes(bufferSize)
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                // Hint to Android to route to the low-latency output path where available.
-                // Falls back silently on devices that can't honor it.
                 .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                 .build()
 
-            // Record creation time to help ignore spurious focus changes during transitions
             audioTrackCreationTime = System.currentTimeMillis()
 
             if (track.state != AudioTrack.STATE_INITIALIZED) {
@@ -328,13 +301,6 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
             audioTrack = track
             logger.i { "AudioTrack created: STATE_INITIALIZED" }
 
-            // Default start threshold is the full bufferSize — HW waits for the
-            // buffer to fill completely before emitting a single sample. Our
-            // wall-clock gate paces writes at HW rate, so the buffer would just
-            // sit at that threshold forever, adding ~100–400 ms of pure latency
-            // that drifts as the buffer slowly drains. Set threshold to 1 frame
-            // so HW starts emitting immediately and effective pipeline lag is
-            // just the HAL/HW latency, which is stable.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 try {
                     track.setStartThresholdInFrames(1)
@@ -345,17 +311,12 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
             }
 
             track.play()
-
             if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
                 logger.e { "AudioTrack.play() called but playState=${track.playState} — not playing" }
             }
 
-            // Set playback state to true since we're starting playback
             shouldPlayAudio = true
-
-            // Apply current volume/mute state
             applyVolume()
-
             listener.onReady()
         } catch (e: Exception) {
             logger.e(e) { "Failed to create AudioTrack" }
@@ -370,22 +331,12 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
             return 0
         }
 
-        // Don't write audio if we've lost focus or been paused
         if (!shouldPlayAudio) {
             logger.d { "Skipping audio write - shouldPlayAudio=false (audio focus lost or paused)" }
-            // Return the full size to indicate we "handled" the data
-            // This prevents the sendspin buffer from backing up
             return data.size
         }
 
         return try {
-            val playState = track.playState
-            val state = track.state
-
-            if (playState != AudioTrack.PLAYSTATE_PLAYING) {
-                logger.w { "AudioTrack not playing! playState=$playState, state=$state" }
-            }
-
             val written = track.write(data, 0, data.size)
             if (written < 0) {
                 val errorName = when (written) {
@@ -407,14 +358,12 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
     }
 
     actual fun pauseSink() {
-        // Any non-focus pause forfeits the auto-resume claim.
         pausedByFocusLoss = false
         audioTrack?.pause()
     }
 
     actual fun resumeSink() {
         if (!shouldPlayAudio) {
-            // Recover from a prior focus loss; otherwise writeRawPcm silently drops PCM.
             if (!requestAudioFocus()) {
                 logger.w { "resumeSink: cannot re-acquire audio focus — sink stays paused" }
                 return
@@ -441,8 +390,8 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
         logger.i { "Stopping raw PCM stream" }
 
         shouldPlayAudio = false
-        pausedByFocusLoss = false // Stream stopped — no auto-resume on focus gain.
-        currentListener = null // Clear listener reference
+        pausedByFocusLoss = false
+        currentListener = null
 
         audioTrack?.let { track ->
             try {
@@ -458,8 +407,11 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
         }
 
         audioTrack = null
-        // Don't release audio focus here - keep it during track transitions
-        // Only release in release() when truly stopping playback
+
+        if (useTransientDuckingFocus) {
+            logger.i { "PoC transient stream ended — releasing audio focus so external media can unduck" }
+            releaseAudioFocus()
+        }
     }
 
     actual fun setVolume(volume: Int) {
@@ -489,8 +441,6 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
 
     private fun applyVolume() {
         val track = audioTrack ?: return
-
-        // AudioTrack uses 0.0 to 1.0 scale
         val volumeFloat = if (isMuted) {
             0f
         } else {
@@ -553,7 +503,7 @@ actual class MediaPlayerController actual constructor(platformContext: PlatformC
     }
 
     actual fun setLongFormSeekIntervals(backSeconds: Long, forwardSeconds: Long) {
-        // Android handles seek intervals via MediaSession custom actions, not here
+        // Android handles seek intervals via MediaSession custom actions, not here.
     }
 
     actual fun release() {
