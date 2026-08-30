@@ -49,6 +49,31 @@ replace_once(
 )
 
 replace_once(
+    """        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+""",
+    """        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(
+                if (useTransientDuckingFocus) {
+                    AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+                } else {
+                    AudioAttributes.USAGE_MEDIA
+                },
+            )
+            .setContentType(
+                if (useTransientDuckingFocus) {
+                    AudioAttributes.CONTENT_TYPE_SPEECH
+                } else {
+                    AudioAttributes.CONTENT_TYPE_MUSIC
+                },
+            )
+            .build()
+""",
+)
+
+replace_once(
     """    private fun releaseAudioFocus() {
 """,
     """    private fun cancelPendingFocusRelease() {
@@ -70,6 +95,31 @@ replace_once(
 
     private fun releaseAudioFocus() {
         cancelPendingFocusRelease()
+""",
+)
+
+replace_once(
+    """                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build(),
+""",
+    """                    AudioAttributes.Builder()
+                        .setUsage(
+                            if (useTransientDuckingFocus) {
+                                AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+                            } else {
+                                AudioAttributes.USAGE_MEDIA
+                            },
+                        )
+                        .setContentType(
+                            if (useTransientDuckingFocus) {
+                                AudioAttributes.CONTENT_TYPE_SPEECH
+                            } else {
+                                AudioAttributes.CONTENT_TYPE_MUSIC
+                            },
+                        )
+                        .build(),
 """,
 )
 
