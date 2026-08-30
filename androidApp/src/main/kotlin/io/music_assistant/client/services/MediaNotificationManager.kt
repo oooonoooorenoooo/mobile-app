@@ -32,7 +32,7 @@ class MediaNotificationManager(
         )
 
         val dismissIntent = Intent(ACTION_NOTIFICATION_DISMISSED).apply {
-            setPackage("io.music_assistant.client")
+            setPackage(context.packageName)
         }
         val dismissPendingIntent = PendingIntent.getBroadcast(
             context,
