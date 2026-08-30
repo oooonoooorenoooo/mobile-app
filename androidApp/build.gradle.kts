@@ -43,6 +43,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Keep the PoC installable next to the official Play Store app.
+            applicationIdSuffix = ".poc"
+            versionNameSuffix = "-poc"
+        }
+
         release {
             signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
