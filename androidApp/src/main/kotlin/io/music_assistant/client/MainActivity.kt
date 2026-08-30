@@ -17,6 +17,7 @@ import io.music_assistant.client.auth.CustomTabsOAuthHandler
 import io.music_assistant.client.auth.OAuthHandler
 import io.music_assistant.client.data.MainDataSource
 import io.music_assistant.client.input.VolumeButtonService
+import io.music_assistant.client.services.AnnouncementEndpointService
 import io.music_assistant.client.services.MainMediaPlaybackService
 import io.music_assistant.client.settings.SettingsRepository
 import io.music_assistant.client.ui.compose.App
@@ -35,6 +36,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+
+        // Custom announcement-endpoint build: once the user has opened the app normally,
+        // keep the local Sendspin endpoint alive even after leaving the UI. The same
+        // service is also started by BootReceiver after future device reboots.
+        runCatching { AnnouncementEndpointService.start(this) }
+            .onFailure { Logger.withTag("MainActivity").w(it) { "Could not start announcement endpoint" } }
 
         // Lock orientation on compact devices, unless the user opted out. The
         // manifest declares no screenOrientation, so re-applying this live only
