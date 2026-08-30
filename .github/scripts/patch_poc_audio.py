@@ -39,10 +39,6 @@ replace_once(
 
         cancelPendingFocusRelease()
 
-        // Reuse focus only while audio is still part of the same logical
-        // announcement (for example pre-announce chime -> speech). Once the PCM
-        // watchdog has released focus, the next announcement gets a fresh MAY_DUCK
-        // request and therefore a new duck/unduck cycle.
         if (continuingAnnouncement && audioFocusRequest != null) {
             logger.i { "Continuing current announcement focus session" }
             return true
@@ -71,13 +67,11 @@ replace_once(
                     AudioAttributes.USAGE_MEDIA
                 },
             )
-            .setContentType(
-                if (useTransientDuckingFocus) {
-                    AudioAttributes.CONTENT_TYPE_SPEECH
-                } else {
-                    AudioAttributes.CONTENT_TYPE_MUSIC
-                },
-            )
+            // Important for Build 9: CONTENT_TYPE_SPEECH suppresses Android's
+            // automatic MAY_DUCK attenuation of the current media app. Keep the
+            // navigation usage, but make the focus request non-speech so Spotify
+            // remains playing and Android can actually lower it.
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
             .build()
 """,
 )
@@ -141,10 +135,6 @@ replace_once(
     """            } else {
                 logger.d { "AudioTrack wrote $written/${data.size} bytes" }
                 if (useTransientDuckingFocus && written > 0) {
-                    // Keep focus alive while PCM is flowing. Chime and speech can be
-                    // separate Sendspin streams, so stream-stop alone must not end
-                    // the ducking session. When no PCM arrives for 1.5 s, focus is
-                    // released and external media can return to its normal level.
                     scheduleAudioFocusRelease()
                 }
                 written
@@ -159,9 +149,6 @@ replace_once(
         }
 """,
     """        if (useTransientDuckingFocus) {
-            // Do not release focus here. A complete announcement can contain more
-            // than one Sendspin stream (pre-announce chime + speech). The PCM idle
-            // watchdog above owns the end-of-announcement decision.
             logger.i { "Sendspin segment ended — waiting for PCM idle timeout before releasing focus" }
         }
 """,
@@ -177,9 +164,6 @@ replace_once(
     """        val volumeFloat = if (isMuted) {
             0f
         } else if (useTransientDuckingFocus) {
-            // This PoC player is used as an announcement endpoint. Keep the MA
-            // announcement itself at full local gain; vehicle guidance volume remains
-            // independently controlled by Android Auto / the head unit.
             1f
         } else {
             (currentVolume / 100f).coerceIn(0f, 1f)
@@ -188,4 +172,4 @@ replace_once(
 )
 
 path.write_text(text)
-print("Applied PoC announcement-focus patch")
+print("Applied PoC announcement-focus patch (Build 9 auto-duck focus attributes)")
