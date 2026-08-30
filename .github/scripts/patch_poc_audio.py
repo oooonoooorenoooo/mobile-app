@@ -20,9 +20,9 @@ replace_once(
     "    private val useTransientDuckingFocus = true\n",
     """    private val useTransientDuckingFocus = true
 
-    // Announcements can consist of multiple consecutive Sendspin streams
-    // (pre-announce chime + speech). Keep focus briefly between those streams,
-    // but always release it after the final audio so external media unducks.
+    // PoC announcement endpoint: focus must be a real transient cycle every time.
+    // Android Auto can otherwise restore external media after the first announcement
+    // but ignore a later MAY_DUCK request from the same still-cached focus state.
     private val focusReleaseHandler = Handler(Looper.getMainLooper())
     private var pendingFocusRelease: Runnable? = null
     private val focusReleaseDelayMs = 900L
@@ -35,23 +35,15 @@ replace_once(
         val focusGain = if (useTransientDuckingFocus) {
 """,
     """    private fun requestAudioFocus(): Boolean {
-        val continuingAnnouncement =
-            useTransientDuckingFocus && hasAudioFocus && pendingFocusRelease != null
-
         cancelPendingFocusRelease()
 
-        // Only reuse focus when a new Sendspin segment arrives during the short
-        // post-stream grace period (for example chime -> speech). If focus is still
-        // marked as held without that grace period, treat it as stale and abandon it
-        // before making a fresh request. This guarantees that every new announcement
-        // generates a new MAY_DUCK cycle.
-        if (continuingAnnouncement && audioFocusRequest != null) {
-            logger.i { "Reusing transient ducking focus for next announcement segment" }
-            return true
-        }
-
+        // IMPORTANT: always end any previous transient focus ownership before a new
+        // Sendspin stream starts. Do not reuse the old request, even for the next
+        // segment. Real Android Auto testing showed that reuse works once, but the
+        // following announcement no longer ducks Spotify. A fresh abandon/request
+        // pair forces Android to create a new MAY_DUCK focus transition every time.
         if (useTransientDuckingFocus && (hasAudioFocus || audioFocusRequest != null)) {
-            logger.i { "Clearing stale transient audio focus before new announcement" }
+            logger.i { "Resetting transient audio focus before fresh announcement request" }
             releaseAudioFocus()
         }
 
@@ -135,15 +127,6 @@ replace_once(
 )
 
 replace_once(
-    """            if (written < 0) {
-                val errorName = when (written) {
-""",
-    """            if (written < 0) {
-                val errorName = when (written) {
-""",
-)
-
-replace_once(
     """            } else {
                 logger.d { "AudioTrack wrote $written/${data.size} bytes" }
                 written
@@ -152,10 +135,8 @@ replace_once(
     """            } else {
                 logger.d { "AudioTrack wrote $written/${data.size} bytes" }
                 if (useTransientDuckingFocus && written > 0) {
-                    // Safety watchdog: some Android Auto / Sendspin combinations do
-                    // not reliably reach stopRawPcmStream after the final packet.
-                    // Reset this timer on every PCM write; once audio really stops,
-                    // focus is abandoned and Spotify/etc. must be allowed to unduck.
+                    // Safety watchdog: if Android Auto / Sendspin misses the normal
+                    // stream-stop callback, the external media still gets unducked.
                     scheduleAudioFocusRelease(focusWriteWatchdogMs)
                 }
                 written
@@ -186,9 +167,8 @@ replace_once(
     """        val volumeFloat = if (isMuted) {
             0f
         } else if (useTransientDuckingFocus) {
-            // This PoC player is used as an announcement endpoint. Keep the MA
-            // announcement itself at full local gain; vehicle guidance volume remains
-            // independently controlled by Android Auto / the head unit.
+            // Keep MA announcement PCM at full local gain. Android Auto / the head
+            // unit applies its independent navigation-guidance volume on top.
             1f
         } else {
             (currentVolume / 100f).coerceIn(0f, 1f)
