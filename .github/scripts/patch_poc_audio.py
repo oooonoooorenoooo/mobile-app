@@ -20,12 +20,13 @@ replace_once(
     "    private val useTransientDuckingFocus = true\n",
     """    private val useTransientDuckingFocus = true
 
-    // MA announcements can consist of several consecutive Sendspin streams
-    // (pre-announce chime + speech). Keep focus alive briefly between streams so
-    // Android does not unduck/reduck the external app between those segments.
+    // Announcements can consist of multiple consecutive Sendspin streams
+    // (pre-announce chime + speech). Keep focus briefly between those streams,
+    // but always release it after the final audio so external media unducks.
     private val focusReleaseHandler = Handler(Looper.getMainLooper())
     private var pendingFocusRelease: Runnable? = null
     private val focusReleaseDelayMs = 900L
+    private val focusWriteWatchdogMs = 1500L
 """,
 )
 
@@ -34,14 +35,24 @@ replace_once(
         val focusGain = if (useTransientDuckingFocus) {
 """,
     """    private fun requestAudioFocus(): Boolean {
+        val continuingAnnouncement =
+            useTransientDuckingFocus && hasAudioFocus && pendingFocusRelease != null
+
         cancelPendingFocusRelease()
 
-        // A new segment of the same announcement arrived while we still own the
-        // transient focus. Reuse it instead of abandoning and immediately requesting
-        // again; that caused audible gaps and incomplete pre-announce chimes.
-        if (useTransientDuckingFocus && hasAudioFocus && audioFocusRequest != null) {
+        // Only reuse focus when a new Sendspin segment arrives during the short
+        // post-stream grace period (for example chime -> speech). If focus is still
+        // marked as held without that grace period, treat it as stale and abandon it
+        // before making a fresh request. This guarantees that every new announcement
+        // generates a new MAY_DUCK cycle.
+        if (continuingAnnouncement && audioFocusRequest != null) {
             logger.i { "Reusing transient ducking focus for next announcement segment" }
             return true
+        }
+
+        if (useTransientDuckingFocus && (hasAudioFocus || audioFocusRequest != null)) {
+            logger.i { "Clearing stale transient audio focus before new announcement" }
+            releaseAudioFocus()
         }
 
         val focusGain = if (useTransientDuckingFocus) {
@@ -81,16 +92,16 @@ replace_once(
         pendingFocusRelease = null
     }
 
-    private fun scheduleAudioFocusRelease() {
+    private fun scheduleAudioFocusRelease(delayMs: Long = focusReleaseDelayMs) {
         cancelPendingFocusRelease()
         val release = Runnable {
             pendingFocusRelease = null
-            logger.i { "Announcement grace period ended — releasing transient audio focus" }
+            logger.i { "Announcement focus timeout ended — releasing transient audio focus" }
             releaseAudioFocus()
         }
         pendingFocusRelease = release
-        focusReleaseHandler.postDelayed(release, focusReleaseDelayMs)
-        logger.i { "Announcement segment ended — keeping ducking focus for ${focusReleaseDelayMs}ms" }
+        focusReleaseHandler.postDelayed(release, delayMs)
+        logger.i { "Transient ducking focus scheduled for release in ${delayMs}ms" }
     }
 
     private fun releaseAudioFocus() {
@@ -124,12 +135,42 @@ replace_once(
 )
 
 replace_once(
+    """            if (written < 0) {
+                val errorName = when (written) {
+""",
+    """            if (written < 0) {
+                val errorName = when (written) {
+""",
+)
+
+replace_once(
+    """            } else {
+                logger.d { "AudioTrack wrote $written/${data.size} bytes" }
+                written
+            }
+""",
+    """            } else {
+                logger.d { "AudioTrack wrote $written/${data.size} bytes" }
+                if (useTransientDuckingFocus && written > 0) {
+                    // Safety watchdog: some Android Auto / Sendspin combinations do
+                    // not reliably reach stopRawPcmStream after the final packet.
+                    // Reset this timer on every PCM write; once audio really stops,
+                    // focus is abandoned and Spotify/etc. must be allowed to unduck.
+                    scheduleAudioFocusRelease(focusWriteWatchdogMs)
+                }
+                written
+            }
+""",
+)
+
+replace_once(
     """        if (useTransientDuckingFocus) {
             logger.i { "PoC transient stream ended — releasing audio focus so external media can unduck" }
             releaseAudioFocus()
         }
 """,
     """        if (useTransientDuckingFocus) {
+            logger.i { "PoC transient stream ended — scheduling focus release after announcement grace period" }
             scheduleAudioFocusRelease()
         }
 """,
@@ -145,9 +186,9 @@ replace_once(
     """        val volumeFloat = if (isMuted) {
             0f
         } else if (useTransientDuckingFocus) {
-            // This PoC player is used as an announcement endpoint. Do not attenuate
-            // the announcement with the persisted local-player volume while Android
-            // is already ducking the external media app.
+            // This PoC player is used as an announcement endpoint. Keep the MA
+            // announcement itself at full local gain; vehicle guidance volume remains
+            // independently controlled by Android Auto / the head unit.
             1f
         } else {
             (currentVolume / 100f).coerceIn(0f, 1f)
