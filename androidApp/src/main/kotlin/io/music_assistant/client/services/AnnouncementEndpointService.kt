@@ -12,7 +12,15 @@ import androidx.core.app.NotificationCompat
 import co.touchlab.kermit.Logger
 import io.music_assistant.client.MainActivity
 import io.music_assistant.client.R
+import io.music_assistant.client.data.LocalPlayerController
 import io.music_assistant.client.data.MainDataSource
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.koin.android.ext.android.inject
 
 /**
@@ -25,6 +33,8 @@ import org.koin.android.ext.android.inject
 class AnnouncementEndpointService : Service() {
     private val logger = Logger.withTag("AnnouncementEndpointService")
     private val dataSource: MainDataSource by inject()
+    private val localPlayerController: LocalPlayerController by inject()
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onCreate() {
         super.onCreate()
@@ -45,6 +55,29 @@ class AnnouncementEndpointService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
+        // The persistent endpoint must keep the *local Sendspin player* alive, not
+        // just the main MA API session. A healthy UI/login therefore no longer masks
+        // a dead local player that Home Assistant reports as unavailable.
+        //
+        // LocalPlayerController.start() is intentionally idempotent: while Sendspin
+        // is Ready/Buffering/Synchronized/Connecting/Authenticating/Handshaking or
+        // Reconnecting it returns immediately; if the client is null/Idle/Error it
+        // recreates it. Running this watchdog also repairs the race where this
+        // foreground service starts after the main API session was already authenticated
+        // and no new session-state edge occurs to trigger MainDataSource's start().
+        serviceScope.launch {
+            while (isActive) {
+                if (dataSource.apiClient.isReadyForCommands.value) {
+                    try {
+                        localPlayerController.start()
+                    } catch (e: Exception) {
+                        logger.w(e) { "Persistent Sendspin watchdog could not start local player" }
+                    }
+                }
+                delay(SENDSPIN_WATCHDOG_INTERVAL_MS)
+            }
+        }
+
         logger.i { "Persistent announcement endpoint started" }
     }
 
@@ -53,6 +86,7 @@ class AnnouncementEndpointService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        serviceScope.cancel()
         dataSource.apiClient.onExternalConsumerInactive()
         logger.i { "Persistent announcement endpoint stopped" }
         super.onDestroy()
@@ -82,6 +116,7 @@ class AnnouncementEndpointService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 941
+        private const val SENDSPIN_WATCHDOG_INTERVAL_MS = 10_000L
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, AnnouncementEndpointService::class.java))
