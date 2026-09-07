@@ -29,9 +29,10 @@ class AnnouncementEndpointService : Service() {
     override fun onCreate() {
         super.onCreate()
 
-        // Resolving MainDataSource creates the local-player stack. Mark the connection as
-        // active so the normal background-disconnect policy does not tear Sendspin down.
-        dataSource.apiClient.onPlaybackActive()
+        // Keep the server connection alive independently of actual playback state.
+        // MainDataSource owns playbackActive/playbackInactive and toggles it when
+        // the local player starts or stops playing.
+        dataSource.apiClient.onExternalConsumerActive()
 
         val notification = createNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -52,7 +53,7 @@ class AnnouncementEndpointService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        dataSource.apiClient.onPlaybackInactive()
+        dataSource.apiClient.onExternalConsumerInactive()
         logger.i { "Persistent announcement endpoint stopped" }
         super.onDestroy()
     }
