@@ -22,6 +22,12 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
     private var didAttachExternalConsumer: Bool = false
     private var readinessSubscription: Cancellable?
 
+    /// While the CarPlay scene is connected, periodically make sure the local
+    /// Sendspin endpoint still exists. This mirrors the Android persistent
+    /// endpoint watchdog, but only during a legitimate CarPlay lifecycle.
+    private var localPlayerWatchdog: Timer?
+    private let localPlayerWatchdogInterval: TimeInterval = 10
+
     /// Monotonic connection generation, bumped on every connect AND
     /// disconnect. Async completions capture it at dispatch and re-check on
     /// delivery: on a rapid disconnect → reconnect, connection A's in-flight
@@ -101,6 +107,7 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
         }
         didAttachExternalConsumer = true
         KmpHelper.shared.onExternalConsumerActive()
+        startLocalPlayerWatchdog()
         // Rehydrate Now Playing from the server; attaching alone never authorizes playback.
         KmpHelper.shared.refreshCarPlayNowPlayingState()
         // Resolve localized strings before building templates: CarPlay template
@@ -127,8 +134,9 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
     func templateApplicationScene(_ templateApplicationScene: CPTemplateApplicationScene, didDisconnectInterfaceController interfaceController: CPInterfaceController) {
         // Invalidate any in-flight didConnect completions for this connection.
         connectionGen += 1
-        // Cancel subscriptions before tearing down state to avoid the
+        // Cancel subscriptions/watchdog before tearing down state to avoid
         // callbacks racing with a nil interfaceController.
+        stopLocalPlayerWatchdog()
         readinessSubscription?.cancel()
         readinessSubscription = nil
         trackSubscription?.cancel()
@@ -154,6 +162,30 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
         os_log("CP: didDisconnect", log: cpLog, type: .default)
     }
 
+    // MARK: - Local-player keepalive
+
+    private func startLocalPlayerWatchdog() {
+        stopLocalPlayerWatchdog()
+
+        // Try immediately. If the API handshake is not ready yet the Kotlin
+        // bridge intentionally no-ops; the readiness callback and timer retry.
+        KmpHelper.shared.ensureCarPlayLocalPlayerActive()
+
+        localPlayerWatchdog = Timer.scheduledTimer(
+            withTimeInterval: localPlayerWatchdogInterval,
+            repeats: true
+        ) { [weak self] _ in
+            guard let self, self.interfaceController != nil,
+                  self.didAttachExternalConsumer else { return }
+            KmpHelper.shared.ensureCarPlayLocalPlayerActive()
+        }
+    }
+
+    private func stopLocalPlayerWatchdog() {
+        localPlayerWatchdog?.invalidate()
+        localPlayerWatchdog = nil
+    }
+
     // MARK: - Readiness handling
 
     /// Called from the Kotlin readiness subscription. The closure already runs
@@ -172,6 +204,9 @@ class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate {
         }
 
         if !wasReady && ready {
+            // The command transport is back. Ensure the Sendspin endpoint is
+            // registered before refreshing CarPlay content.
+            KmpHelper.shared.ensureCarPlayLocalPlayerActive()
             // Reconnected — re-fire the Library fetch. Drilldowns re-fetch
             // when re-entered, so only the top-level needs refreshing.
             refreshLibraryOnReconnect()
