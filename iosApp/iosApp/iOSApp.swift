@@ -250,6 +250,8 @@ struct iOSApp: App {
         // Register the Swift audio player with Kotlin before KMP services are created.
         PlatformPlayerProvider.shared.player = player
         volumeButtonObserver.player = player
+        HAAnnouncementBridge.shared.configure(player: player)
+        HAAnnouncementBridge.shared.start()
 
         #if DEBUG
         // Route Kermit logs to the unified log un-redacted during development

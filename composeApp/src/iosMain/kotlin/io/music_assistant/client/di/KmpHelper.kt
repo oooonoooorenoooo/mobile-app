@@ -13,6 +13,7 @@ import io.music_assistant.client.api.ServiceClient
 import io.music_assistant.client.auth.AuthenticationManager
 import io.music_assistant.client.auth.OAuthCallback
 import io.music_assistant.client.carplay.CarPlayStrings
+import io.music_assistant.client.data.LocalPlayerController
 import io.music_assistant.client.data.MainDataSource
 import io.music_assistant.client.data.NowPlayingModes
 import io.music_assistant.client.data.NowPlayingTrack
@@ -79,6 +80,7 @@ object KmpHelper : KoinComponent {
     val authManager: AuthenticationManager by inject()
     private val deepLinkBus: DeepLinkBus by inject()
     private val mediaItemRepository: MediaItemRepository by inject()
+    private val localPlayerController: LocalPlayerController by inject()
     private val settingsRepository: SettingsRepository by inject()
     private val volumeButtonService: VolumeButtonService by inject()
     private val artworkHttpClient: HttpClient by inject(named("webrtcHttpClient"))
@@ -133,6 +135,26 @@ object KmpHelper : KoinComponent {
 
     fun onExternalConsumerActive() = serviceClient.onExternalConsumerActive()
     fun onExternalConsumerInactive() = serviceClient.onExternalConsumerInactive()
+
+    /**
+     * Idempotently ensure the iOS local Sendspin player is attached whenever
+     * CarPlay is an active external consumer. Mirrors the Android persistent
+     * announcement endpoint's LocalPlayerController.start() watchdog without
+     * inventing an unsupported background execution mode on iOS.
+     *
+     * Calls made before the MA command transport is ready are harmless; the
+     * next CarPlay watchdog tick retries after readiness is established.
+     */
+    fun ensureCarPlayLocalPlayerActive() {
+        if (!settingsRepository.sendspinEnabled.value || !serviceClient.isReadyForCommands.value) return
+        mainScope.launch {
+            runCatching { localPlayerController.start() }
+                .onFailure { error ->
+                    log.w(error) { "CarPlay could not ensure local Sendspin player: ${error.message}" }
+                }
+        }
+    }
+
     fun refreshCarPlayNowPlayingState() = mainDataSource.refreshPlayersAndQueues()
 
     // MARK: - Artwork loader (Swift-callable)

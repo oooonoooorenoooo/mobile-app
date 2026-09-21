@@ -45,6 +45,18 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
     // have running before the interruption.
     private var pausedByInterruption = false
 
+    // MARK: - Overlay Announcements
+    // Native overlay path used by the custom Home Assistant bridge. The main
+    // Sendspin AudioQueue keeps rendering while AVAudioPlayer speaks over it.
+    // Ducking is applied only to our main queue, so CarPlay never sees a stop/
+    // restart and the interrupted song continues underneath the announcement.
+    private var announcementPlayer: AVAudioPlayer?
+    private var announcementDownloadTask: URLSessionDataTask?
+    private var mainVolume: Float = 1.0
+    private var mainMuted = false
+    private var announcementDuckFactor: Float = 1.0
+    private var announcementGeneration: UInt64 = 0
+
     // MARK: - Logging
     // Routes through Kermit (NativeLog) so these reach the shareable in-memory buffer
     // and os.Logger
@@ -289,17 +301,121 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
     }
 
     func setVolume(volume: Int32) {
-        guard let queue = audioQueue else { return }
-        let floatVolume = Float(volume) / 100.0
-        AudioQueueSetParameter(queue, kAudioQueueParam_Volume, floatVolume)
+        mainVolume = (Float(volume) / 100.0).clamped(to: 0.0...1.0)
+        applyMainQueueVolume()
     }
 
     func setMuted(muted: Bool) {
+        mainMuted = muted
+        applyMainQueueVolume()
+    }
+
+    private func applyMainQueueVolume() {
         guard let queue = audioQueue else { return }
-        AudioQueueSetParameter(queue, kAudioQueueParam_Volume, muted ? 0.0 : 1.0)
+        let effective: Float = mainMuted ? 0.0 : mainVolume * announcementDuckFactor
+        AudioQueueSetParameter(queue, kAudioQueueParam_Volume, effective)
+    }
+
+    /// Play an HTTP(S) audio clip over the current Sendspin stream without
+    /// stopping or pausing it. The main stream is attenuated locally for the
+    /// duration of the clip, then restored to the latest server-controlled
+    /// volume. Safe to call while no music is playing as well.
+    func playOverlayAnnouncement(
+        urlString: String,
+        duckingLevel: Double = 0.22,
+        announcementVolume: Double = 1.0
+    ) {
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else {
+            logError("Overlay announcement rejected invalid URL")
+            return
+        }
+
+        announcementGeneration &+= 1
+        let generation = announcementGeneration
+
+        announcementDownloadTask?.cancel()
+        announcementDownloadTask = nil
+        announcementPlayer?.stop()
+        announcementPlayer = nil
+        announcementDuckFactor = 1.0
+        applyMainQueueVolume()
+
+        logInfo("Overlay announcement download started")
+        let request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 15
+        )
+        announcementDownloadTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            guard generation == self.announcementGeneration else { return }
+
+            if let error {
+                self.logError("Overlay announcement download failed: \(error.localizedDescription)")
+                return
+            }
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                self.logError("Overlay announcement HTTP \(http.statusCode)")
+                return
+            }
+            guard let data, !data.isEmpty else {
+                self.logError("Overlay announcement returned no audio data")
+                return
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, generation == self.announcementGeneration else { return }
+                do {
+                    NowPlayingCoordinator.shared.activatePlayback()
+
+                    let player = try AVAudioPlayer(data: data)
+                    player.delegate = self
+                    player.volume = Float(announcementVolume).clamped(to: 0.0...1.0)
+                    player.prepareToPlay()
+
+                    self.announcementDuckFactor =
+                        Float(duckingLevel).clamped(to: 0.0...1.0)
+                    self.applyMainQueueVolume()
+                    self.announcementPlayer = player
+
+                    guard player.play() else {
+                        self.logError("Overlay announcement AVAudioPlayer refused play()")
+                        self.finishOverlayAnnouncement()
+                        return
+                    }
+                    self.logInfo("Overlay announcement started; main stream remains active")
+                } catch {
+                    self.logError("Overlay announcement decode failed: \(error.localizedDescription)")
+                    self.finishOverlayAnnouncement()
+                }
+            }
+        }
+        announcementDownloadTask?.resume()
+    }
+
+    func stopOverlayAnnouncement() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.announcementGeneration &+= 1
+            self.announcementDownloadTask?.cancel()
+            self.announcementDownloadTask = nil
+            self.announcementPlayer?.stop()
+            self.finishOverlayAnnouncement()
+        }
+    }
+
+    private func finishOverlayAnnouncement() {
+        announcementPlayer = nil
+        announcementDownloadTask = nil
+        announcementDuckFactor = 1.0
+        applyMainQueueVolume()
+        logInfo("Overlay announcement finished; main stream volume restored")
     }
 
     func dispose() {
+        stopOverlayAnnouncement()
         // The Now Playing surface is cleared by the track channel going null
         // (pipeline teardown removes the current item); no direct clear here.
         stopAudioQueue()
@@ -355,6 +471,7 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
         }
 
         audioQueue = queue
+        applyMainQueueVolume()
 
         // Allocate and prime buffers
         for _ in 0..<kNumberOfBuffers {
@@ -436,6 +553,29 @@ class NativeAudioController: NSObject, PlatformAudioPlayer {
             self?.logInfo("Remote command: \(command)")
             self?.remoteCommandHandler?.onCommand(command: command, source: "remote")
         }
+    }
+}
+
+// MARK: - AVAudioPlayerDelegate
+
+extension NativeAudioController: AVAudioPlayerDelegate {
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard player === announcementPlayer else { return }
+        finishOverlayAnnouncement()
+    }
+
+    func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        guard player === announcementPlayer else { return }
+        if let error {
+            logError("Overlay announcement playback error: \(error.localizedDescription)")
+        }
+        finishOverlayAnnouncement()
+    }
+}
+
+private extension Comparable {
+    func clamped(to limits: ClosedRange<Self>) -> Self {
+        min(max(self, limits.lowerBound), limits.upperBound)
     }
 }
 
